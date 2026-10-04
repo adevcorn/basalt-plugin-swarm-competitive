@@ -142,6 +142,8 @@ pub struct PeerCandidateEvaluation {
     pub ast_convergence: AstConvergenceTelemetry,
     pub pbt_fuzz: PbtFuzzTelemetry,
     pub intent_drift: IntentDriftTelemetry,
+    #[serde(default)]
+    pub tool_categories: Vec<String>,
     pub composite_score: f64,
 }
 
@@ -159,6 +161,14 @@ pub struct SwarmRunResponse {
     pub composite_winner_score: f64,
     pub summary: String,
     pub peers: Vec<PeerCandidateEvaluation>,
+}
+
+/// Evaluation request for ranking completed or in-flight peer candidates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmEvaluateRequest {
+    pub task: String,
+    pub swarm_id: String,
+    pub candidates: Vec<PeerCandidateEvaluation>,
 }
 
 /// Mid-flight steering request.
@@ -283,6 +293,15 @@ impl CompetitiveRaceEngine {
         }
 
         score
+    }
+
+    /// Synthesizes and ranks candidate evaluations (alias for evaluate_and_rank).
+    pub fn evaluate_and_synthesize(
+        task: &str,
+        swarm_id: &str,
+        candidates: Vec<PeerCandidateEvaluation>,
+    ) -> SwarmRunResponse {
+        Self::evaluate_and_rank(swarm_id, task, candidates)
     }
 
     /// Executes the competitive evaluation pipeline over candidates.
@@ -479,6 +498,21 @@ pub extern "C" fn basalt_swarm_steer(req_ptr: *const u8, req_len: usize) -> u64 
     pack_output(bytes)
 }
 
+/// Hook: `basalt_swarm_evaluate(req_ptr, req_len) -> u64`
+#[no_mangle]
+pub extern "C" fn basalt_swarm_evaluate(req_ptr: *const u8, req_len: usize) -> u64 {
+    if req_ptr.is_null() || req_len == 0 {
+        return 0;
+    }
+    let slice = unsafe { core::slice::from_raw_parts(req_ptr, req_len) };
+    let Ok(req) = serde_json::from_slice::<SwarmEvaluateRequest>(slice) else {
+        return 0;
+    };
+    let response = CompetitiveRaceEngine::evaluate_and_synthesize(&req.task, &req.swarm_id, req.candidates);
+    let bytes = serde_json::to_vec(&response).unwrap_or_default();
+    pack_output(bytes)
+}
+
 /// Hook: `basalt_capability_handle(cap_ptr, cap_len, req_ptr, req_len) -> i64`
 #[no_mangle]
 pub extern "C" fn basalt_capability_handle(
@@ -513,6 +547,14 @@ pub extern "C" fn basalt_capability_handle(
             };
             let hypotheses = CompetitiveRaceEngine::formulate_hypotheses(&req.task, req.concurrency, &req.target_files);
             let json_bytes = serde_json::to_vec(&hypotheses).unwrap_or_default();
+            pack_success(json_bytes)
+        }
+        "swarm-strategy:evaluate" | "swarm:evaluate" | "swarm-strategy:synthesize" | "swarm:synthesize" => {
+            let Ok(req) = serde_json::from_slice::<SwarmEvaluateRequest>(req_bytes) else {
+                return pack_error(-1005);
+            };
+            let resp = CompetitiveRaceEngine::evaluate_and_synthesize(&req.task, &req.swarm_id, req.candidates);
+            let json_bytes = serde_json::to_vec(&resp).unwrap_or_default();
             pack_success(json_bytes)
         }
         "swarm-strategy:steer" | "swarm:steer" => {
@@ -589,6 +631,7 @@ mod tests {
                 within_safe_boundary: true,
                 flagged_deviations: Vec::new(),
             },
+            tool_categories: vec!["read".to_string(), "write".to_string(), "verify".to_string()],
             composite_score: 0.0,
         };
 
@@ -617,6 +660,7 @@ mod tests {
                 within_safe_boundary: false,
                 flagged_deviations: vec!["added unexpected unsafe block".to_string()],
             },
+            tool_categories: vec!["read".to_string(), "write".to_string(), "verify".to_string()],
             composite_score: 0.0,
         };
 
@@ -643,6 +687,7 @@ mod tests {
                 ast_convergence: AstConvergenceTelemetry { overlap_risk: 0.0, intersecting_symbols: Vec::new(), auto_merge_guaranteed: true },
                 pbt_fuzz: PbtFuzzTelemetry { passed_iterations: 1000, target_iterations: 1000, invariants_verified: Vec::new(), execution_cycles: 0, failed_counterexample: None },
                 intent_drift: IntentDriftTelemetry { drift_score: 0.0, within_safe_boundary: true, flagged_deviations: Vec::new() },
+                tool_categories: vec!["read".to_string(), "write".to_string(), "verify".to_string()],
                 composite_score: 150.0,
             },
             PeerCandidateEvaluation {
@@ -656,6 +701,7 @@ mod tests {
                 ast_convergence: AstConvergenceTelemetry { overlap_risk: 0.5, intersecting_symbols: Vec::new(), auto_merge_guaranteed: false },
                 pbt_fuzz: PbtFuzzTelemetry { passed_iterations: 10, target_iterations: 1000, invariants_verified: Vec::new(), execution_cycles: 0, failed_counterexample: Some("overflow".to_string()) },
                 intent_drift: IntentDriftTelemetry { drift_score: 0.5, within_safe_boundary: false, flagged_deviations: Vec::new() },
+                tool_categories: vec!["read".to_string(), "write".to_string(), "verify".to_string()],
                 composite_score: -100.0,
             },
         ];
@@ -720,6 +766,49 @@ mod tests {
         assert_ne!(res_plan, 0);
         let plan_len = (res_plan as u64 & 0xFFFFFFFF) as usize;
         assert!(plan_len > 0);
+
+        let eval_cap = "swarm-strategy:evaluate";
+        let eval_req = serde_json::json!({
+            "task": "Build async event dispatcher",
+            "swarm_id": "swm-eval-1",
+            "candidates": [
+                {
+                    "peer_id": 1,
+                    "role": "implementer",
+                    "hypothesis": "Minimal Surgical",
+                    "status": "passed",
+                    "modified_files": ["src/dispatcher.rs"],
+                    "check_passed": true,
+                    "test_passed": true,
+                    "ast_convergence": {
+                        "overlap_risk": 0.0,
+                        "intersecting_symbols": [],
+                        "auto_merge_guaranteed": true
+                    },
+                    "pbt_fuzz": {
+                        "passed_iterations": 5000,
+                        "target_iterations": 5000,
+                        "invariants_verified": ["thread_safety"],
+                        "execution_cycles": 12000,
+                        "failed_counterexample": null
+                    },
+                    "intent_drift": {
+                        "drift_score": 0.01,
+                        "within_safe_boundary": true,
+                        "flagged_deviations": []
+                    },
+                    "composite_score": 190.0
+                }
+            ]
+        });
+        let eval_bytes = serde_json::to_vec(&eval_req).unwrap();
+        let res_eval = basalt_capability_handle(eval_cap.as_ptr(), eval_cap.len(), eval_bytes.as_ptr(), eval_bytes.len());
+        assert_ne!(res_eval, 0);
+        let eval_len = (res_eval as u64 & 0xFFFFFFFF) as usize;
+        assert!(eval_len > 0);
+
+        let eval_packed = basalt_swarm_evaluate(eval_bytes.as_ptr(), eval_bytes.len());
+        assert_ne!(eval_packed, 0);
 
         let invalid_cap = "swarm-unknown";
         let res_invalid = basalt_capability_handle(invalid_cap.as_ptr(), invalid_cap.len(), std::ptr::null(), 0);
