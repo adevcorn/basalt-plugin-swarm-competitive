@@ -7,7 +7,7 @@ Reference Swarm Strategy Plugin for [Basalt](https://github.com/adevcorn/basalt)
 ## 🚀 Capabilities & Metadata
 
 - **Plugin Name**: `swarm_competitive`
-- **Hook Flags**: `CAP_SWARM_STRATEGY` (`0x00000080`)
+- **Hook Flags**: `CAP_SWARM_STRATEGY` (`1 << 23`, `0x00800000`) | `CAP_CAPABILITY_HANDLE` (`1 << 17`, `0x00020000`)
 - **Provides**: `swarm-strategy@competitive/v1`
 - **ABI Version**: `1`
 - **Target**: `wasm32-unknown-unknown` (WASM sandbox) or native cdylib
